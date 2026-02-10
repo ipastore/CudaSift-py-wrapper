@@ -16,19 +16,21 @@ find_package(CUDA)
 if (NOT CUDA_FOUND)
   message(STATUS "CUDA not found. Project will not be built.")
 endif(NOT CUDA_FOUND)
+find_package(pybind11 CONFIG REQUIRED)
 
 if (WIN32)
   set(EXTRA_CXX_FLAGS "/DVERBOSE /D_CRT_SECURE_NO_WARNINGS ")
-  list(APPEND CUDA_NVCC_FLAGS "-arch=sm_35;--compiler-options;-O2;-DVERBOSE") 
+  list(APPEND CUDA_NVCC_FLAGS "-arch=sm_75;--compiler-options;-O2;-DVERBOSE") 
 endif()
 if (UNIX)
   if (APPLE)
     set(EXTRA_CXX_FLAGS "-DVERBOSE -msse2")
-    list(APPEND CUDA_NVCC_FLAGS "-arch=sm_35;--compiler-options;-O2;-DVERBOSE") 
+    list(APPEND CUDA_NVCC_FLAGS "-arch=sm_75;--compiler-options;-O2;-DVERBOSE") 
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -msse2 ")
-    list(APPEND CUDA_NVCC_FLAGS "-lineinfo;-ccbin;/usr/bin/gcc-6;--compiler-options;-O2;-D_FORCE_INLINES;-DVERBOSE_NOT") 
+    list(APPEND CUDA_NVCC_FLAGS "-lineinfo;-arch=sm_75;--compiler-options;-O2;-D_FORCE_INLINES;-DVERBOSE_NOT")
   endif()
+  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-fPIC")
 endif()
 
 set(cuda_sources
@@ -44,7 +46,7 @@ set(cuda_sources
 
 set(sources
   geomFuncs.cpp  
-  mainSift.cpp  
+  mainSift.cpp
 )
 
 include_directories(
@@ -53,9 +55,9 @@ include_directories(
 
 #SET(CUDA_SEPARABLE_COMPILATION ON)
 
-cuda_add_executable(cudasift ${cuda_sources} ${sources} OPTIONS -arch=sm_35)
+cuda_add_executable(cudasift ${cuda_sources} ${sources} OPTIONS -arch=sm_75)
 
-#cuda_add_executable(l2net l2netD.cu OPTIONS -arch=sm_35)
+#cuda_add_executable(l2net l2netD.cu OPTIONS -arch=sm_75)
 
 set_target_properties(cudasift PROPERTIES
   COMPILE_FLAGS "${EXTRA_CXX_FLAGS}"			   
@@ -64,6 +66,17 @@ set_target_properties(cudasift PROPERTIES
 target_link_libraries(cudasift ${CUDA_cudadevrt_LIBRARY} ${OpenCV_LIBS})
 #  /usr/local/cuda/lib64/libcudadevrt.a ${OpenCV_LIBS} 
 #)
+
+if (pybind11_FOUND)
+  cuda_add_library(cudasift_cuda STATIC ${cuda_sources} OPTIONS -arch=sm_75)
+  set_target_properties(cudasift_cuda PROPERTIES
+    COMPILE_FLAGS "${EXTRA_CXX_FLAGS}"
+    POSITION_INDEPENDENT_CODE ON
+  )
+  pybind11_add_module(cudasift_py python/cudasift_pybind.cpp)
+  target_include_directories(cudasift_py PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(cudasift_py PRIVATE cudasift_cuda ${CUDA_cudadevrt_LIBRARY} ${OpenCV_LIBS})
+endif()
  
 install(FILES 
   ${cuda_sources} 
