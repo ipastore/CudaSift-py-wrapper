@@ -30,12 +30,14 @@ void InitCuda(int devNum)
   int clockRateKHz;
   cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, 0);
   cudaGetDeviceProperties(&prop, devNum);
+#ifdef VERBOSE
   printf("Device Number: %d\n", devNum);
   printf("  Device name: %s\n", prop.name);
   printf("  Memory Clock Rate (MHz): %d\n",clockRateKHz);
   printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
   printf("  Peak Memory Bandwidth (GB/s): %.1f\n\n",
 	 2.0*clockRateKHz*(prop.memoryBusWidth/8)/1.0e6);
+#endif  
 }
 
 float *AllocSiftTempMemory(int width, int height, int numOctaves, bool scaleUp)
@@ -116,7 +118,9 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh, lowestScale, 1.0f, memoryTmp, memorySub + height*iAlignUp(width, 128));
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
+#ifdef VERBOSE    
     printf("SIFT extraction time =        %.2f ms %d\n", timer1.read(), siftData.numPts);
+#endif
   } else {
     CudaImage upImg;
     upImg.Allocate(width, height, iAlignUp(width, 128), false, memoryTmp);
@@ -130,7 +134,9 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
     RescalePositions(siftData, 0.5f);
+#ifdef VERBOSE    
     printf("SIFT extraction time =        %.2f ms\n", timer1.read());
+#endif
   } 
   
   if (!tempMemory)
@@ -142,7 +148,9 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     safeCall(cudaMemcpy(siftData.h_data, siftData.d_data, sizeof(SiftPoint)*siftData.numPts, cudaMemcpyDeviceToHost));
 #endif
   double totTime = timer.read();
+#ifdef VERBOSE      
   printf("Incl prefiltering & memcpy =  %.2f ms %d\n\n", totTime, siftData.numPts);
+#endif
 }
 
 int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves, double initBlur, float thresh, float lowestScale, float subsampling, float *memoryTmp, float *memorySub) 
