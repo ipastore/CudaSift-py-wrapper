@@ -70,7 +70,7 @@ py::tuple extract_sift(
     kp(i, 1) = pts[i].ypos;
     sc(i) = pts[i].scale;
     ori(i) = pts[i].orientation;
-    sco(i) = pts[i].score;
+    sco(i) = pts[i].sharpness;
     for (int j = 0; j < 128; ++j) {
       desc(i, j) = pts[i].data[j];
     }
@@ -87,12 +87,12 @@ PYBIND11_MODULE(cudasift_py, m) {
       "extract",
       &extract_sift,
       py::arg("image"),
-      py::arg("num_octaves") = 4,
+      py::arg("num_octaves") = 6,
       py::arg("init_blur") = 1.0f,
-      py::arg("thresh") = 0.0066667f,
+      py::arg("thresh") = 1.7f,
       py::arg("lowest_scale") = 0.0f,
       py::arg("scale_up") = false,
-      py::arg("max_pts") = 2024,
+      py::arg("max_pts") = 2048,
       py::arg("dev_num") = 0,
       R"doc(
 Extract SIFT features from a 2D float32 image.
