@@ -23,7 +23,11 @@ typedef struct {
 
 typedef struct {
   int numPts;         // Number of available Sift points
-  int maxPts;         // Number of allocated Sift points
+  int maxPts;         // Final returned Sift point cap
+  int maxWorkPts;     // Internal candidate capacity allocated on device/host
+  bool useScoreFilter; // Use post-detection top-k by abs(sharpness)
+  bool usePerOctaveCap; // Split score-filter budget evenly across octaves
+  int numOctaves;     // Total octave count for per-octave quota calculation
 #ifdef MANAGEDMEM
   SiftPoint *m_data;  // Managed data
 #else
@@ -36,7 +40,7 @@ void InitCuda(int devNum = 0);
 float *AllocSiftTempMemory(int width, int height, int numOctaves, bool scaleUp = false);
 void FreeSiftTempMemory(float *memoryTmp);
 void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double initBlur, float thresh, float lowestScale = 0.0f, bool scaleUp = false, float *tempMemory = 0);
-void InitSiftData(SiftData &data, int num = 1024, bool host = false, bool dev = true);
+void InitSiftData(SiftData &data, int num = 1024, bool host = false, bool dev = true, bool useScoreFilter = true, bool usePerOctaveCap = true);
 void FreeSiftData(SiftData &data);
 void PrintSiftData(SiftData &data);
 double MatchSiftData(SiftData &data1, SiftData &data2);

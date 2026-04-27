@@ -16,7 +16,9 @@ py::tuple extract_sift(
     float lowest_scale,
     bool scale_up,
     int max_pts,
-    int dev_num) {
+    int dev_num,
+    bool use_score_filter,
+    bool use_per_octave_cap) {
   py::buffer_info buf = image.request();
   if (buf.ndim != 2) {
     throw std::invalid_argument("image must be a 2D float32 array (H, W)");
@@ -40,7 +42,7 @@ py::tuple extract_sift(
     cuda_img.Allocate(width, height, iAlignUp(width, 128), false, nullptr, host_ptr);
     cuda_img.Download();
 
-    InitSiftData(sift_data, max_pts, true, true);
+    InitSiftData(sift_data, max_pts, true, true, use_score_filter, use_per_octave_cap);
     temp_memory = AllocSiftTempMemory(width, height, num_octaves, scale_up);
     ExtractSift(sift_data, cuda_img, num_octaves, init_blur, thresh, lowest_scale, scale_up, temp_memory);
     FreeSiftTempMemory(temp_memory);
@@ -87,13 +89,15 @@ PYBIND11_MODULE(cudasift_py, m) {
       "extract",
       &extract_sift,
       py::arg("image"),
-      py::arg("num_octaves") = 6,
+      py::arg("num_octaves") = 4,
       py::arg("init_blur") = 1.0f,
-      py::arg("thresh") = 1.7f,
+      py::arg("thresh") = 0.4f,
       py::arg("lowest_scale") = 0.0f,
       py::arg("scale_up") = false,
       py::arg("max_pts") = 2048,
       py::arg("dev_num") = 0,
+      py::arg("use_score_filter") = true,
+      py::arg("use_per_octave_cap") = true,
       R"doc(
 Extract SIFT features from a 2D float32 image.
 
@@ -103,5 +107,11 @@ increase the threshold accordingly.
 
 Returns:
   keypoints (N,2), scales (N,), oris (N,), scores (N,), descriptors (N,128)
+
+Note:
+  By default, score filtering uses an equal per-octave base-keypoint cap.
+  Set use_per_octave_cap=False for global score filtering, or
+  use_score_filter=False for legacy truncation.
+  scores are extraction-time sharpness values.
 )doc");
 }

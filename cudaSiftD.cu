@@ -11,6 +11,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 __constant__ int d_MaxNumPoints;
+__constant__ int d_UseLegacyTruncation;
 __device__ unsigned int d_PointCounter[8*2+1];
 __constant__ float d_ScaleDownKernel[5]; 
 __constant__ float d_LowPassKernel[2*LOWPASS_R+1]; 
@@ -1413,18 +1414,21 @@ __global__ void FindPointsMultiNew(float *d_Data0, SiftPoint *d_Sift, int width,
 	pds = __fdividef(ds, dss);
       }
       float dval = 0.5f*(dx*pdx + dy*pdy + ds*pds);
-      int maxPts = d_MaxNumPoints;
       float sc = powf(2.0f, (float)scale/NUM_SCALES) * exp2f(pds*factor);
       if (sc>=lowestScale) {
 	atomicMax(&d_PointCounter[2*octave+0], d_PointCounter[2*octave-1]); 
 	unsigned int idx = atomicInc(&d_PointCounter[2*octave+0], 0x7fffffff);
-	idx = (idx>=maxPts ? maxPts-1 : idx);
-	d_Sift[idx].xpos = xpos + pdx;
-	d_Sift[idx].ypos = ypos + pdy;
-	d_Sift[idx].scale = sc;
-	d_Sift[idx].sharpness = val + dval;
-	d_Sift[idx].edgeness = edge;
-	d_Sift[idx].subsampling = subsampling;
+	if (d_UseLegacyTruncation) {
+	  idx = (idx>=d_MaxNumPoints ? d_MaxNumPoints-1 : idx);
+	}
+	if (idx < d_MaxNumPoints) {
+	  d_Sift[idx].xpos = xpos + pdx;
+	  d_Sift[idx].ypos = ypos + pdy;
+	  d_Sift[idx].scale = sc;
+	  d_Sift[idx].sharpness = val + dval;
+	  d_Sift[idx].edgeness = edge;
+	  d_Sift[idx].subsampling = subsampling;
+	}
       }
     }
   }
@@ -2035,4 +2039,3 @@ __global__ void LowPassBlock(float *d_Image, float *d_Result, int width, int pit
 		     k[1]*(xrows[(ly - 3)%N][tx] + xrows[(ly + 3)%N][tx]) +
 		     k[0]*(xrows[(ly - 4)%N][tx] + xrows[(ly + 4)%N][tx]);
 }
-

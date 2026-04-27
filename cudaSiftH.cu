@@ -5,8 +5,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <iostream>
 #include <algorithm>
+#include <limits>
+#include <vector>
 #include "cudautils.h"
 
 #include "cudaImage.h"
@@ -15,6 +18,78 @@
 #include "cudaSiftH.h"
 
 #include "cudaSiftD.cu"
+
+namespace {
+
+constexpr int kSiftCandidateCapacityScale = 4;
+
+int GetSiftWorkCapacity(int maxPts)
+{
+  if (maxPts <= 0)
+    return 0;
+  const long long scaled = static_cast<long long>(maxPts) * kSiftCandidateCapacityScale;
+  const long long clamped = std::min<long long>(scaled, std::numeric_limits<int>::max());
+  return static_cast<int>(std::max<long long>(maxPts, clamped));
+}
+
+unsigned int GetOctaveQuota(const SiftData &siftData, int octave)
+{
+  if (!siftData.usePerOctaveCap || siftData.numOctaves <= 0)
+    return static_cast<unsigned int>(siftData.maxPts);
+
+  const int base = siftData.maxPts / siftData.numOctaves;
+  const int remainder = siftData.maxPts % siftData.numOctaves;
+  const int finestRemainderStart = siftData.numOctaves - remainder + 1;
+  const int extra = (remainder > 0 && octave >= finestRemainderStart) ? 1 : 0;
+  return static_cast<unsigned int>(std::max(0, base + extra));
+}
+
+void FilterKeypointsBySharpness(SiftData &siftData, int octave, unsigned int fstPts)
+{
+  unsigned int *d_PointCounterAddr;
+  safeCall(cudaGetSymbolAddress((void**)&d_PointCounterAddr, d_PointCounter));
+#ifdef MANAGEDMEM
+  SiftPoint *devicePoints = siftData.m_data;
+#else
+  SiftPoint *devicePoints = siftData.d_data;
+#endif
+
+  unsigned int rawTotPts = 0;
+  safeCall(cudaMemcpy(&rawTotPts, &d_PointCounterAddr[2*octave+0], sizeof(int), cudaMemcpyDeviceToHost));
+
+  const unsigned int storedTotPts = std::min(rawTotPts, static_cast<unsigned int>(siftData.maxWorkPts));
+  const unsigned int storedCandPts = (storedTotPts > fstPts ? storedTotPts - fstPts : 0U);
+  const int remainingBudget = std::max(0, siftData.maxPts - static_cast<int>(fstPts));
+  const unsigned int localBudget = siftData.usePerOctaveCap
+      ? GetOctaveQuota(siftData, octave)
+      : static_cast<unsigned int>(remainingBudget);
+  const unsigned int keepPts = std::min(storedCandPts, localBudget);
+
+  if (storedCandPts == 0 || keepPts == storedCandPts) {
+    const unsigned int filteredTotPts = fstPts + keepPts;
+    safeCall(cudaMemcpy(&d_PointCounterAddr[2*octave+0], &filteredTotPts, sizeof(int), cudaMemcpyHostToDevice));
+    safeCall(cudaMemcpy(&d_PointCounterAddr[2*octave+1], &filteredTotPts, sizeof(int), cudaMemcpyHostToDevice));
+    return;
+  }
+
+  std::vector<SiftPoint> points(storedCandPts);
+  safeCall(cudaMemcpy(points.data(), devicePoints + fstPts, sizeof(SiftPoint)*storedCandPts, cudaMemcpyDeviceToHost));
+
+  auto score_cmp = [](const SiftPoint &lhs, const SiftPoint &rhs) {
+    return std::fabs(lhs.sharpness) > std::fabs(rhs.sharpness);
+  };
+  std::nth_element(points.begin(), points.begin() + keepPts, points.end(), score_cmp);
+  points.resize(keepPts);
+  std::sort(points.begin(), points.end(), score_cmp);
+
+  safeCall(cudaMemcpy(devicePoints + fstPts, points.data(), sizeof(SiftPoint)*keepPts, cudaMemcpyHostToDevice));
+
+  const unsigned int filteredTotPts = fstPts + keepPts;
+  safeCall(cudaMemcpy(&d_PointCounterAddr[2*octave+0], &filteredTotPts, sizeof(int), cudaMemcpyHostToDevice));
+  safeCall(cudaMemcpy(&d_PointCounterAddr[2*octave+1], &filteredTotPts, sizeof(int), cudaMemcpyHostToDevice));
+}
+
+}  // namespace
 
 void InitCuda(int devNum)
 {
@@ -37,7 +112,7 @@ void InitCuda(int devNum)
   printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
   printf("  Peak Memory Bandwidth (GB/s): %.1f\n\n",
 	 2.0*clockRateKHz*(prop.memoryBusWidth/8)/1.0e6);
-#endif  
+#endif
 }
 
 float *AllocSiftTempMemory(int width, int height, int numOctaves, bool scaleUp)
@@ -76,10 +151,13 @@ void FreeSiftTempMemory(float *memoryTmp)
 void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double initBlur, float thresh, float lowestScale, bool scaleUp, float *tempMemory) 
 {
   TimerGPU timer(0);
+  siftData.numOctaves = numOctaves;
   unsigned int *d_PointCounterAddr;
   safeCall(cudaGetSymbolAddress((void**)&d_PointCounterAddr, d_PointCounter));
   safeCall(cudaMemset(d_PointCounterAddr, 0, (8*2+1)*sizeof(int)));
-  safeCall(cudaMemcpyToSymbol(d_MaxNumPoints, &siftData.maxPts, sizeof(int)));
+  safeCall(cudaMemcpyToSymbol(d_MaxNumPoints, &siftData.maxWorkPts, sizeof(int)));
+  const int useLegacyTruncation = siftData.useScoreFilter ? 0 : 1;
+  safeCall(cudaMemcpyToSymbol(d_UseLegacyTruncation, &useLegacyTruncation, sizeof(int)));
 
   const int nd = NUM_SCALES + 3;
   int w = img.width*(scaleUp ? 2 : 1);
@@ -118,7 +196,7 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh, lowestScale, 1.0f, memoryTmp, memorySub + height*iAlignUp(width, 128));
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
-#ifdef VERBOSE    
+#ifdef VERBOSE
     printf("SIFT extraction time =        %.2f ms %d\n", timer1.read(), siftData.numPts);
 #endif
   } else {
@@ -134,7 +212,7 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
     RescalePositions(siftData, 0.5f);
-#ifdef VERBOSE    
+#ifdef VERBOSE
     printf("SIFT extraction time =        %.2f ms\n", timer1.read());
 #endif
   } 
@@ -148,7 +226,7 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     safeCall(cudaMemcpy(siftData.h_data, siftData.d_data, sizeof(SiftPoint)*siftData.numPts, cudaMemcpyDeviceToHost));
 #endif
   double totTime = timer.read();
-#ifdef VERBOSE      
+#ifdef VERBOSE
   printf("Incl prefiltering & memcpy =  %.2f ms %d\n\n", totTime, siftData.numPts);
 #endif
 }
@@ -179,11 +257,12 @@ int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves, double i
 void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave, float thresh, float lowestScale, float subsampling, float *memoryTmp)
 {
   const int nd = NUM_SCALES + 3;
-#ifdef VERBOSE
   unsigned int *d_PointCounterAddr;
   safeCall(cudaGetSymbolAddress((void**)&d_PointCounterAddr, d_PointCounter));
-  unsigned int fstPts, totPts;
+  unsigned int fstPts;
   safeCall(cudaMemcpy(&fstPts, &d_PointCounterAddr[2*octave-1], sizeof(int), cudaMemcpyDeviceToHost)); 
+#ifdef VERBOSE
+  unsigned int totPts;
   TimerGPU timer0;
 #endif
   CudaImage diffImg[nd];
@@ -219,10 +298,31 @@ void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave, float thr
 #endif
   float baseBlur = pow(2.0f, -1.0f/NUM_SCALES);
   float diffScale = pow(2.0f, 1.0f/NUM_SCALES);
+  (void)baseBlur;
+  (void)diffScale;
   LaplaceMulti(texObj, img, diffImg, octave); 
   FindPointsMulti(diffImg, siftData, thresh, 10.0f, 1.0f/NUM_SCALES, lowestScale/subsampling, subsampling, octave);
 #ifdef VERBOSE
   double gpuTimeDoG = timer1.read();
+  unsigned int rawCandTotPts = 0;
+  safeCall(cudaMemcpy(&rawCandTotPts, &d_PointCounterAddr[2*octave+0], sizeof(int), cudaMemcpyDeviceToHost));
+  auto filterStart = std::chrono::steady_clock::now();
+#endif
+  if (siftData.useScoreFilter)
+    FilterKeypointsBySharpness(siftData, octave, fstPts);
+#ifdef VERBOSE
+  const double filterMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - filterStart).count();
+  unsigned int filteredBaseTotPts = 0;
+  safeCall(cudaMemcpy(&filteredBaseTotPts, &d_PointCounterAddr[2*octave+0], sizeof(int), cudaMemcpyDeviceToHost));
+  const unsigned int storedCandTotPts = std::min(rawCandTotPts, static_cast<unsigned int>(siftData.maxWorkPts));
+  const unsigned int rawCandCount = (rawCandTotPts > fstPts ? rawCandTotPts - fstPts : 0U);
+  const unsigned int storedCandCount = (storedCandTotPts > fstPts ? storedCandTotPts - fstPts : 0U);
+  const unsigned int keptCandCount = (filteredBaseTotPts > fstPts ? filteredBaseTotPts - fstPts : 0U);
+  const unsigned int octaveQuota = siftData.useScoreFilter
+      ? (siftData.usePerOctaveCap ? GetOctaveQuota(siftData, octave)
+                                  : static_cast<unsigned int>(std::max(0, siftData.maxPts - static_cast<int>(fstPts))))
+      : static_cast<unsigned int>(siftData.maxPts);
+  const size_t extraBufferBytes = sizeof(SiftPoint) * static_cast<size_t>(std::max(0, siftData.maxWorkPts - siftData.maxPts));
   TimerGPU timer4;
 #endif
   ComputeOrientations(texObj, img, siftData, octave); 
@@ -235,17 +335,32 @@ void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave, float thr
   double totTime = timer0.read();
   printf("GPU time : %.2f ms + %.2f ms + %.2f ms = %.2f ms\n", totTime-gpuTimeDoG-gpuTimeSift, gpuTimeDoG, gpuTimeSift, totTime);
   safeCall(cudaMemcpy(&totPts, &d_PointCounterAddr[2*octave+1], sizeof(int), cudaMemcpyDeviceToHost));
-  totPts = (totPts<siftData.maxPts ? totPts : siftData.maxPts);
+  totPts = (totPts<siftData.maxWorkPts ? totPts : siftData.maxWorkPts);
+  printf("Octave %d keypoint filter (%s): quota=%u raw_local=%u stored_local=%u kept_base=%u final_after_orient=%u final_cap=%d work_cap=%d filter=%.3f ms extra=%zuB overflow=%s\n",
+         octave,
+         siftData.useScoreFilter ? (siftData.usePerOctaveCap ? "score-per-octave" : "score-global") : "legacy",
+         octaveQuota, rawCandCount, storedCandCount, keptCandCount,
+         totPts > fstPts ? totPts - fstPts : 0U,
+         siftData.maxPts, siftData.maxWorkPts, filterMs, extraBufferBytes,
+         (rawCandTotPts > static_cast<unsigned int>(siftData.maxWorkPts) ? "yes" : "no"));
   if (totPts>0) 
-    printf("           %.2f ms / DoG,  %.4f ms / Sift,  #Sift = %d\n", gpuTimeDoG/NUM_SCALES, gpuTimeSift/(totPts-fstPts), totPts-fstPts); 
+    printf("           %.2f ms / DoG,  %.4f ms / Sift,  #Sift = %d\n", gpuTimeDoG/NUM_SCALES, gpuTimeSift/(totPts-fstPts), totPts-fstPts);
+  printf("           cand=%u kept=%u filter=%.3f ms orient+desc=%.3f ms\n",
+         rawCandTotPts > fstPts ? rawCandTotPts - fstPts : 0U,
+         totPts > fstPts ? totPts - fstPts : 0U,
+         filterMs, gpuTimeSift);
 #endif
 }
 
-void InitSiftData(SiftData &data, int num, bool host, bool dev)
+void InitSiftData(SiftData &data, int num, bool host, bool dev, bool useScoreFilter, bool usePerOctaveCap)
 {
   data.numPts = 0;
   data.maxPts = num;
-  int sz = sizeof(SiftPoint)*num;
+  data.useScoreFilter = useScoreFilter;
+  data.usePerOctaveCap = usePerOctaveCap;
+  data.numOctaves = 0;
+  data.maxWorkPts = (useScoreFilter ? GetSiftWorkCapacity(num) : num);
+  int sz = sizeof(SiftPoint)*data.maxWorkPts;
 #ifdef MANAGEDMEM
   safeCall(cudaMallocManaged((void **)&data.m_data, sz));
 #else
@@ -271,6 +386,10 @@ void FreeSiftData(SiftData &data)
 #endif
   data.numPts = 0;
   data.maxPts = 0;
+  data.maxWorkPts = 0;
+  data.useScoreFilter = false;
+  data.usePerOctaveCap = false;
+  data.numOctaves = 0;
 }
 
 void PrintSiftData(SiftData &data)
@@ -280,7 +399,7 @@ void PrintSiftData(SiftData &data)
 #else
   SiftPoint *h_data = data.h_data;
   if (data.h_data==NULL) {
-    h_data = (SiftPoint *)malloc(sizeof(SiftPoint)*data.maxPts);
+    h_data = (SiftPoint *)malloc(sizeof(SiftPoint)*data.maxWorkPts);
     safeCall(cudaMemcpy(h_data, data.d_data, sizeof(SiftPoint)*data.numPts, cudaMemcpyDeviceToHost));
     data.h_data = h_data;
   }
@@ -308,7 +427,8 @@ void PrintSiftData(SiftData &data)
     }
   }
   printf("Number of available points: %d\n", data.numPts);
-  printf("Number of allocated points: %d\n", data.maxPts);
+  printf("Final point cap: %d\n", data.maxPts);
+  printf("Number of allocated points: %d\n", data.maxWorkPts);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -522,4 +642,3 @@ double FindPointsMulti(CudaImage *sources, SiftData &siftData, float thresh, flo
   checkMsg("FindPointsMulti() execution failed\n");
   return 0.0;
 }
-
